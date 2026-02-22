@@ -1,0 +1,14 @@
+# ignore rendered video files
+*.mp4
+
+# ignore images
+*.png
+*.svg
+
+# ignore subtitles
+*.ass
+*.srt
+*.json
+
+# ignore audio
+*.wav

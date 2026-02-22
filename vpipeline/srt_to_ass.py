@@ -3,13 +3,15 @@
 import argparse
 import json
 import re
+import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
 # ------------------ time + ASS helpers ------------------
 
 def ass_color_from_rgb(hex_color: str) -> str:
-    # "#RRGGBB" -> "&H00BBGGRR&"
+    # "#RRGGBB" -> "&H00BBGGRR&" (ASS uses BBGGRR)
     h = hex_color.strip()
     if h.startswith("#"):
         h = h[1:]
@@ -60,16 +62,13 @@ def srt_ts_to_seconds(ts: str) -> float:
 # ------------------ parsing ------------------
 
 def parse_srt(path: Path):
-    """
-    Returns list: [{start, end, text}, ...]
-    """
+    """Returns list: [{start, end, text}, ...]"""
     raw = path.read_text(encoding="utf-8").strip()
     if not raw:
         return []
 
     blocks = re.split(r"\n\s*\n", raw)
     out = []
-
     ts_re = re.compile(r"(\d\d:\d\d:\d\d,\d\d\d)\s*-->\s*(\d\d:\d\d:\d\d,\d\d\d)")
 
     for b in blocks:
@@ -88,9 +87,7 @@ def parse_srt(path: Path):
 
 
 def load_words_from_json(path: Path):
-    """
-    Flat time-ordered list: [{word,start,end}, ...]
-    """
+    """Flat time-ordered list: [{word,start,end}, ...]"""
     payload = json.loads(path.read_text(encoding="utf-8"))
     words = []
     for seg in payload.get("segments", []) or []:
@@ -108,78 +105,141 @@ def load_words_from_json(path: Path):
     words.sort(key=lambda x: (x["start"], x["end"]))
     return words
 
-
 # ------------------ alignment with merge/split ------------------
 
 _norm_re = re.compile(r"[^\w]+", re.UNICODE)
 
 def norm(tok: str) -> str:
-    # Lowercase, strip punctuation-ish. Good enough for “compound vs split” cases.
+    # Lowercase, strip punctuation-ish. Good enough for German compound join/split.
     t = tok.strip().lower()
     t = _norm_re.sub("", t)
     return t
 
-
 def tokenize_srt(text: str) -> list[str]:
-    # Proofread text: preserve punctuation as attached tokens; we only space-split.
     return [t for t in text.split() if t.strip()]
 
+def _edit_distance_leq1(a: str, b: str) -> bool:
+    """True iff Levenshtein distance <= 1."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+
+    # same length: <= 1 substitution
+    if la == lb:
+        diffs = 0
+        for i in range(la):
+            if a[i] != b[i]:
+                diffs += 1
+                if diffs > 1:
+                    return False
+        return True
+
+    # length differs by 1: <= 1 insertion/deletion
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la  # now lb == la + 1
+
+    i = j = 0
+    used = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            if used:
+                return False
+            used = True
+            j += 1
+    return True
+
+def token_eq(a: str, b: str) -> bool:
+    """Conservative fuzzy equality for normalized tokens."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+
+    la, lb = len(a), len(b)
+
+    # Narrow short-token rule: only allow tiny edits with shared prefix
+    # (handles her->herr, es->ess-type, etc. without going permissive).
+    if 3 <= la <= 5 and 3 <= lb <= 5 and a.isalpha() and b.isalpha():
+        # prefix constraint is important; without it, short words become ambiguous.
+        if a[:2] == b[:2] and _edit_distance_leq1(a, b):
+            return True
+        return False
+
+    # Long-token conservative fuzzy (your original logic)
+    if min(la, lb) < 6:
+        return False
+    if abs(la - lb) > 2:
+        return False
+
+    r = SequenceMatcher(None, a, b).ratio()
+    return r >= 0.90
 
 def align_spans(srt_tokens: list[str], json_words: list[str]) -> list[tuple[int, int] | None]:
     """
-    Align JSON words (timing slots) to SRT tokens (display tokens).
+    Align JSON word slots to SRT token spans.
+
     Returns spans per JSON word: (i_start, i_end_excl) in SRT token indices, or None.
 
     Supports:
-    - many JSON -> one SRT token  (compound joined in SRT)
-      e.g. SRT "Hausnummer" vs JSON ["Haus", "nummer"]
-    - one JSON -> many SRT tokens  (rare, but handle)
-      e.g. SRT ["Haus", "nummer"] vs JSON ["Hausnummer"]
+      - many JSON -> one SRT token  (compound joined in SRT)
+      - one JSON -> many SRT tokens (rare)
+      - conservative fuzzy substitutions (spelling corrections)
 
-    Heuristic greedy with small lookahead. Works well if edits are mostly punctuation/spelling
-    and occasional compounding changes.
+    Assumes:
+      - edits are mostly punctuation/spelling + occasional compounding
+      - SRT timestamps anchor alignment per block
     """
     a = srt_tokens
     b = json_words
+
     an = [norm(x) for x in a]
     bn = [norm(x) for x in b]
 
     spans: list[tuple[int, int] | None] = [None] * len(b)
 
-    i = 0  # SRT token index
-    j = 0  # JSON word index
+    i = 0  # index in SRT
+    j = 0  # index in JSON
 
-    def is_empty_norm(x: str) -> bool:
+    def empty(x: str) -> bool:
         return x == ""
 
     while j < len(b) and i < len(a):
-        # Skip SRT tokens that normalize to empty (pure punctuation etc.)
-        if is_empty_norm(an[i]):
+        if empty(an[i]):
             i += 1
             continue
-        # Skip JSON words that normalize to empty (shouldn't happen, but be safe)
-        if is_empty_norm(bn[j]):
+
+        if empty(bn[j]):
             spans[j] = None
             j += 1
             continue
 
-        # 1:1 match
-        if an[i] == bn[j]:
+        # ----------------------------
+        # 1:1 match (exact or fuzzy)
+        # ----------------------------
+        if token_eq(an[i], bn[j]):
             spans[j] = (i, i + 1)
             i += 1
             j += 1
             continue
 
-        # Many JSON -> one SRT (JSON split, SRT compound)
-        # Try bn[j] + bn[j+1] + ... == an[i]
         matched = False
+
+        # ---------------------------------------------------
+        # many JSON -> one SRT (JSON split, SRT compound)
+        # Example: JSON ["weg","von","hier"] -> SRT ["weg-von-hier"]
+        # ---------------------------------------------------
         acc = ""
         jj = j
-        while jj < len(b) and len(acc) <= len(an[i]) and (jj - j) < 4:  # cap merge length
+        while jj < len(b) and (jj - j) < 4:
             if bn[jj]:
                 acc += bn[jj]
-            if acc == an[i]:
-                # Map all these JSON words to same SRT token
+            if token_eq(acc, an[i]):
                 for k in range(j, jj + 1):
                     spans[k] = (i, i + 1)
                 i += 1
@@ -187,55 +247,77 @@ def align_spans(srt_tokens: list[str], json_words: list[str]) -> list[tuple[int,
                 matched = True
                 break
             jj += 1
+
         if matched:
             continue
 
-        # One JSON -> many SRT (SRT split, JSON compound)
-        # Try an[i] + an[i+1] + ... == bn[j]
+        # ---------------------------------------------------
+        # one JSON -> many SRT (SRT split, JSON compound)
+        # Example: JSON ["hausnummer"] -> SRT ["haus","nummer"]
+        # ---------------------------------------------------
         acc = ""
         ii = i
-        while ii < len(a) and len(acc) <= len(bn[j]) and (ii - i) < 4:  # cap split length
+        while ii < len(a) and (ii - i) < 4:
             if an[ii]:
                 acc += an[ii]
-            if acc == bn[j]:
-                spans[j] = (i, ii + 1)  # highlight across multiple SRT tokens
+            if token_eq(acc, bn[j]):
+                spans[j] = (i, ii + 1)
                 i = ii + 1
                 j += 1
                 matched = True
                 break
             ii += 1
+
         if matched:
             continue
 
-        # Fallback: advance whichever side seems “ahead”.
-        # If the current SRT token norm is a substring of the JSON word norm, assume SRT is split -> advance i.
+        # ---------------------------------------------------
+        # fallback: advance cautiously without hard-mapping
+        # ---------------------------------------------------
+        # If SRT token seems to be substring of JSON word,
+        # likely SRT split; advance SRT.
         if an[i] and bn[j] and an[i] in bn[j]:
             i += 1
         else:
-            # Otherwise assume JSON has extra split/noise -> advance j.
-            spans[j] = (i, i + 1)  # keep something highlightable instead of None
+            # leave as None; move JSON forward
+            spans[j] = None
             j += 1
 
-    # Fill remaining JSON with last known span (stability > perfection)
+    # -------------------------------------------------------
+    # LIMITED forward-fill (avoid catastrophic drift)
+    # Only tolerate up to 2 consecutive unmapped slots.
+    # -------------------------------------------------------
     last = None
+    run = 0
+
     for idx in range(len(spans)):
         if spans[idx] is None:
-            spans[idx] = last
+            if last is not None and run < 2:
+                spans[idx] = last
+                run += 1
+            else:
+                run += 1
         else:
             last = spans[idx]
+            run = 0
 
-    # If everything was None, leave it (caller will handle)
     return spans
 
+# ------------------ rendering ------------------
 
-def render_line_with_span(
+def render_line_with_span_subset(
     srt_tokens: list[str],
+    subset_idx: list[int],
     span: tuple[int, int] | None,
     *,
     primary_ass: str,
     hilite_ass: str,
 ) -> str:
-    if not srt_tokens:
+    """Render only tokens referenced by subset_idx, keeping their original order.
+    Highlight the intersection of subset_idx with the given span.
+    This is what enables chunking: the displayed line is a subset of the original SRT line.
+    """
+    if not subset_idx:
         return ""
 
     lo, hi = (-1, -1)
@@ -243,9 +325,12 @@ def render_line_with_span(
         lo, hi = span
 
     out = []
-    for idx, tok in enumerate(srt_tokens):
+    for ti in subset_idx:
+        if not (0 <= ti < len(srt_tokens)):
+            continue
+        tok = srt_tokens[ti]
         esc = ass_escape(tok)
-        if span is not None and lo <= idx < hi:
+        if span is not None and lo <= ti < hi:
             out.append(rf"{{\c{hilite_ass}}}{esc}{{\c{primary_ass}}}")
         else:
             out.append(esc)
@@ -276,12 +361,18 @@ def make_header(*, res_x: int, res_y: int, font: str, font_size: int,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="ASS word-highlight from proofread SRT text + faster-whisper JSON timing grid (robust to compounds)."
+        description="Generate ASS word-highlight from proofread SRT (text truth) + faster-whisper JSON (timing truth)."
     )
     ap.add_argument("stem", help="Reads stem.srt + stem.json; writes stem.ass unless --out")
     ap.add_argument("--out", default=None)
 
+    # video/layout
     ap.add_argument("--res", required=True, help="WxH, e.g. 1080x1920")
+    ap.add_argument("--align", type=int, default=6, help="ASS alignment 1..9 (default 6 middle-right)")
+    ap.add_argument("--x", type=int, required=True)
+    ap.add_argument("--y", type=int, required=True)
+
+    # style
     ap.add_argument("--font", required=True)
     ap.add_argument("--font-size", type=int, required=True)
     ap.add_argument("--primary", required=True, help="#RRGGBB")
@@ -289,12 +380,14 @@ def main():
     ap.add_argument("--outline", type=int, default=3)
     ap.add_argument("--shadow", type=int, default=0)
 
-    ap.add_argument("--align", type=int, default=6, help="ASS alignment 1..9 (default 6 middle-right)")
-    ap.add_argument("--x", type=int, required=True)
-    ap.add_argument("--y", type=int, required=True)
-
+    # timing behavior
     ap.add_argument("--slop", type=float, default=0.12, help="Seconds: include JSON words near SRT edges")
     ap.add_argument("--min-word-dur", type=float, default=0.10, help="Seconds: clamp ultra-short highlights")
+
+    # chunking (display only)
+    ap.add_argument("--max-words", type=int, default=0, help="If >0, cap chunk length in (unique) SRT tokens")
+    ap.add_argument("--min-words", type=int, default=2, help="Minimum words before punctuation split")
+    ap.add_argument("--pad", type=float, default=0.15, help="End padding in seconds (clamped to SRT block end)")
 
     args = ap.parse_args()
 
@@ -310,7 +403,6 @@ def main():
 
     w_str, h_str = args.res.lower().split("x", 1)
     res_x, res_y = int(w_str), int(h_str)
-
     if not (1 <= args.align <= 9):
         raise SystemExit("--align must be 1..9")
 
@@ -319,6 +411,7 @@ def main():
 
     blocks = parse_srt(srt_path)
     grid_words = load_words_from_json(json_path)
+
     if not blocks:
         raise SystemExit("No parsable SRT blocks.")
     if not grid_words:
@@ -337,21 +430,22 @@ def main():
 
     tag_prefix = rf"{{\an{args.align}\pos({args.x},{args.y})\c{primary_ass}}}"
 
-    # Pointer into global JSON word list for efficient window scans
+    # pointer into global JSON word list for efficient window scan
     j0 = 0
-    events = []
+    events: list[tuple[float, float, str]] = []
+
+    punct_set = set(",.;:!?")
 
     for blk in blocks:
         st = float(blk["start"])
         et = float(blk["end"])
-        srt_text = blk["text"]
-        srt_tokens = tokenize_srt(srt_text)
+        srt_tokens = tokenize_srt(blk["text"])
         if not srt_tokens:
             continue
 
-        # Collect JSON words whose start falls into this block window (+slop)
-        a = st - args.slop
-        b = et + args.slop
+        # collect JSON words within this SRT block window (+slop)
+        a = st - float(args.slop)
+        b = et + float(args.slop)
 
         while j0 < len(grid_words) and grid_words[j0]["start"] < a:
             j0 += 1
@@ -363,33 +457,128 @@ def main():
             k += 1
 
         if not local:
+            # nothing timed under this SRT block; skip (or warn later if you want)
             continue
 
         local_json_tokens = [w["word"] for w in local]
         spans = align_spans(srt_tokens, local_json_tokens)
 
-        # Emit one Dialogue per JSON word slot
-        for idx, w in enumerate(local):
-            ws = max(st, float(w["start"]))
+        # Warn if alignment quality is poor for this block.
+        unmapped = sum(1 for sp in spans if sp is None)
+        if unmapped:
+            frac = unmapped / max(1, len(spans))
+            if frac >= 0.25:
+                print(
+                    f"[warn] weak alignment in block {ass_ts(st)}-{ass_ts(et)}: {unmapped}/{len(spans)} unmapped",
+                    file=sys.stderr,
+                )
 
-            if idx + 1 < len(local):
-                we = min(et, float(local[idx + 1]["start"]))
-            else:
-                we = min(et, float(w["end"]))
+        # Chunk the DISPLAY tokens based on SRT tokens, but time it on the JSON grid.
+        # We chunk by accumulating unique SRT token indices referenced by consecutive JSON word spans.
+        chunks = []
+        buf_json: list[int] = []
+        buf_tok_idx: list[int] = []
+        seen_tok: set[int] = set()
+        last_span_for_tokens: tuple[int, int] | None = None
 
-            if we - ws < args.min_word_dur:
-                we = min(et, ws + args.min_word_dur)
+        def push_chunk() -> None:
+            nonlocal buf_json, buf_tok_idx, seen_tok
+            if not buf_json:
+                return
+            j_first = buf_json[0]
+            j_last = buf_json[-1]
+            ch_start = float(local[j_first]["start"])
+            # clamp padded end to SRT block end
+            ch_end = min(float(local[j_last]["end"]) + float(args.pad), et)
+            chunks.append({
+                "j_first": j_first,
+                "j_last": j_last,
+                "start": ch_start,
+                "end": ch_end,
+                "tok_idx": list(buf_tok_idx),
+            })
+            buf_json = []
+            buf_tok_idx = []
+            seen_tok = set()
 
-            if we <= ws:
+        for j_rel in range(len(local)):
+            spn = spans[j_rel]
+            spn_for_tokens = spn if spn is not None else last_span_for_tokens
+            if spn_for_tokens is None:
+                # Nothing to display yet; keep the word in timing grid but we can't add tokens.
+                buf_json.append(j_rel)
                 continue
 
-            line = render_line_with_span(
-                srt_tokens,
-                spans[idx],
-                primary_ass=primary_ass,
-                hilite_ass=hilite_ass,
-            )
-            events.append((ws, we, line))
+            # remember last usable span for token accumulation
+            last_span_for_tokens = spn_for_tokens
+
+            lo, hi = spn_for_tokens
+            # add unique SRT token indices for this span
+            for ti in range(lo, hi):
+                if 0 <= ti < len(srt_tokens) and ti not in seen_tok:
+                    seen_tok.add(ti)
+                    buf_tok_idx.append(ti)
+
+            buf_json.append(j_rel)
+
+            word_count = len(buf_tok_idx)
+
+            # punctuation boundary based on the last token of this span
+            last_tok = srt_tokens[hi - 1] if (hi - 1) < len(srt_tokens) else ""
+            punct_break = bool(last_tok and last_tok[-1] in punct_set and word_count >= int(args.min_words))
+
+            cap_break = bool(int(args.max_words) > 0 and word_count >= int(args.max_words))
+
+            # Critical: do NOT split between JSON words that map to the same SRT token span
+            # (e.g. when you merge a German compound in the proofread SRT: "weg-von-hier").
+            # Otherwise the next chunk may start with a JSON word whose highlight span is
+            # not present in that chunk's token subset, causing the highlight to "stick".
+            same_span_as_next = False
+            if (punct_break or cap_break) and (j_rel + 1) < len(local):
+                cur = spans[j_rel]
+                nxt = spans[j_rel + 1]
+                if cur is not None and nxt is not None and cur == nxt:
+                    same_span_as_next = True
+
+            if (punct_break or cap_break) and not same_span_as_next:
+                push_chunk()
+
+        push_chunk()  # tail
+
+        # Emit word-highlight events within each chunk
+        for ch in chunks:
+            j_first = ch["j_first"]
+            j_last = ch["j_last"]
+            ch_start = float(ch["start"])
+            ch_end = float(ch["end"])
+            tok_idx = ch["tok_idx"]
+
+            for j_rel in range(j_first, j_last + 1):
+                w = local[j_rel]
+                ws = max(ch_start, float(w["start"]))
+
+                if j_rel + 1 <= j_last:
+                    we = min(ch_end, float(local[j_rel + 1]["start"]))
+                else:
+                    we = min(ch_end, float(w["end"]))
+
+                if we - ws < float(args.min_word_dur):
+                    we = min(ch_end, ws + float(args.min_word_dur))
+
+                if we <= ws:
+                    continue
+
+                line = render_line_with_span_subset(
+                    srt_tokens,
+                    tok_idx,
+                    spans[j_rel],
+                    primary_ass=primary_ass,
+                    hilite_ass=hilite_ass,
+                )
+                if not line:
+                    continue
+
+                events.append((ws, we, line))
 
     if not events:
         raise SystemExit("No ASS events generated. Increase --slop or check SRT/JSON overlap.")

@@ -67,19 +67,22 @@ SUB_PRESETS = {
         # chunk/timing behaviour for srt_to_ass.py
         "slop": 0.12,
         "min_word_dur": 0.10,
+        "max_words": 4,
+        "min_words": 1,
+        "pad": 0.2,
 
         # style
         "font": "Oswald",
-        "font_size": 52,
-        "primary": "#FFFFFF",   # normal text color (do NOT reuse scheme['text'] blindly; readability first)
+        "font_size": 140,
+        "primary": "scheme",   # normal text color; resolved from selected SCHEME['text'] in build.py
         # highlight color is set at runtime from the selected scheme by default (can be changed below)
 
-        "outline": 3,
+        "outline": 1,
         "shadow": 0,
 
         # positioning (absolute pixel coordinates using \pos)
         "align": 6,     # middle-right
-        "margin_r": 120,
+        "margin_r": 100,
         "y_offset": 0,  # add/subtract pixels from vertical center
     }
 }
@@ -402,6 +405,7 @@ def run_srt_to_ass(
     res_w: int,
     res_h: int,
     preset: dict,
+    primary_color: str,
     highlight_color: str,
 ) -> None:
     """Generate an ASS file from proofread SRT + word-timestamp JSON."""
@@ -417,7 +421,7 @@ def run_srt_to_ass(
         "--res", f"{res_w}x{res_h}",
         "--font", str(preset["font"]),
         "--font-size", str(int(preset["font_size"])),
-        "--primary", str(preset["primary"]),
+        "--primary", str(primary_color),
         "--highlight", str(highlight_color),
         "--outline", str(int(preset["outline"])),
         "--shadow", str(int(preset["shadow"])),
@@ -426,6 +430,9 @@ def run_srt_to_ass(
         "--y", str(int(y)),
         "--slop", str(float(preset["slop"])),
         "--min-word-dur", str(float(preset["min_word_dur"])),
+        "--max-words", str(int(preset.get("max_words", 0))),
+        "--min-words", str(int(preset.get("min_words", 2))),
+        "--pad", str(float(preset.get("pad", 0.15))),
     ]
 
     subprocess.run(cmd, check=True)
@@ -503,12 +510,14 @@ def main() -> None:
 
         preset = SUB_PRESETS["vertical"]
         # Highlight color defaults to the selected scheme; override here if you want a fixed subtitle accent.
+        primary = scheme["text"] if str(preset.get("primary","")).lower() == "scheme" else str(preset.get("primary","#FFFFFF"))
         run_srt_to_ass(
             stem=stem,
             out_ass=ass_path,
             res_w=layout["w"],
             res_h=layout["h"],
             preset=preset,
+            primary_color=primary,
             highlight_color=scheme["highlight"],
         )
 
