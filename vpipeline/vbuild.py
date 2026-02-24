@@ -8,6 +8,19 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+def normalize_hex6(color: str) -> str:
+    """Normalize '#RRGGBB'/'RRGGBB'/'0xRRGGBB' to '#rrggbb'."""
+    c = color.strip()
+    if c.lower().startswith("0x"):
+        c = c[2:]
+    if c.startswith("#"):
+        c = c[1:]
+    c = c.lower()
+    if not re.fullmatch(r"[0-9a-f]{6}", c):
+        raise ValueError(f"Bad color {color!r} (expected RRGGBB / #RRGGBB / 0xRRGGBB)")
+    return "#" + c
+
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
@@ -143,15 +156,20 @@ def prompt_user_inputs() -> dict:
         default=audio_default,
         validate=lambda s: Path(s).expanduser().exists(),
     ).execute()
-    
-    srt = inquirer.text(
-        message="Subtitle file (.srt) [required for vertical]:",
-        default=srt_default,
-        validate=lambda s: (s.strip() == "") or Path(s).expanduser().exists(),
-    ).execute()
+
+    # Subtitle file is only needed for vertical output (burn-in).
+    # For horizontal output we deliberately don't ask for it, so you can build video without ever transcribing.
+    if layout == "vertical":
+        srt = inquirer.text(
+            message="Subtitle file (.srt) [required for vertical]:",
+            default=srt_default,
+            validate=lambda s: (s.strip() == "") or Path(s).expanduser().exists(),
+        ).execute()
+    else:
+        srt = ""
 
     return {"layout": layout, "scheme": scheme, "title": title, "author": author, "audio": audio, "srt": srt}
-
+    
 
 def derive_outputs_from_audio(audio_path: Path) -> tuple[Path, Path]:
     # This checks the name of the audio and names the PNG accordingly.
@@ -396,8 +414,6 @@ def export_png_with_inkscape(svg_path: Path, png_path: Path) -> None:
     print(f"[png] Wrote: {png_path} ({png_path.stat().st_size} bytes)")
 
 
-
-
 def run_srt_to_ass(
     *,
     stem: Path,
@@ -442,10 +458,15 @@ def run_vid_gen(
     audio_path: Path,
     *,
     highlight_color: str,
-    orientation: str,
+    is_vertical: bool,
     ass_path: Path | None,
 ) -> None:
-    """Call vid_gen.sh with a stable interface."""
+    """Call vid_gen.sh with a stable interface.
+
+    Hard rule:
+      - subtitles are burned only for vertical output AND only when an ASS path is explicitly provided.
+      - horizontal builds never pass any subtitle-related arguments.
+    """
     vid_gen = SCRIPT_DIR / "vid_gen.sh"
     cmd = [
         str(vid_gen),
@@ -455,11 +476,10 @@ def run_vid_gen(
         highlight_color,     # visualizer color
     ]
 
-    if ass_path is not None:
-        cmd += ["--ass", str(ass_path)]
-
-    if orientation == "vertical":
+    if is_vertical:
         cmd.append("--vert")
+        if ass_path is not None:
+            cmd += ["--ass", str(ass_path)]
 
     subprocess.run(cmd, check=True)
 
@@ -467,9 +487,12 @@ def run_vid_gen(
 def main() -> None:
     conf = prompt_user_inputs()
     print(f"[pick] conf.layout = {conf['layout']!r}")
-    layout = LAYOUTS[conf["layout"]]
+    layout_key = conf["layout"]
+    layout = LAYOUTS[layout_key]
+    is_vertical = (layout_key == "vertical")
     print(f"[layout] orientation={layout['orientation']!r} size={layout['w']}x{layout['h']}")
     scheme = SCHEMES[conf["scheme"]]
+    scheme = {k: normalize_hex6(v) for k, v in scheme.items()}
 
     audio_path = Path(conf["audio"]).expanduser().resolve()
     srt_raw = conf.get("srt", "").strip()
@@ -499,7 +522,7 @@ def main() -> None:
 
     # For vertical/Shorts: generate an ASS subtitle file (burned in) from proofread SRT + JSON word timing.
     ass_path = None
-    if layout["orientation"] == "vertical":
+    if is_vertical:
         if srt_path is None:
             raise SystemExit("Vertical output requires a proofread .srt file (same stem as audio).")
         json_path = srt_path.with_suffix(".json")
@@ -526,7 +549,7 @@ def main() -> None:
         out_png,
         audio_path,
         highlight_color=scheme["highlight"],
-        orientation=layout["orientation"],
+        is_vertical=is_vertical,
         ass_path=ass_path,
     )
     

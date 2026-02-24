@@ -19,6 +19,8 @@ AUDIO="$2"
 
 # Defaults
 RAW_COLOR="d79921"   # highlight for visualizer
+
+unset ASSFILE
 ASSFILE=""           # optional subtitle burn-in
 VERT=0
 
@@ -62,12 +64,6 @@ done
 RAW_COLOR="$(norm_hex6 "$RAW_COLOR")"
 COLOR="0x${RAW_COLOR}"
 
-# Validate ASS file if provided
-if [ -n "$ASSFILE" ] && [ ! -f "$ASSFILE" ]; then
-  echo "ASS not found: $ASSFILE"
-  exit 1
-fi
-
 # Derive output name from audio file: input.wav -> input.mp4
 BASE="${AUDIO%.*}"
 
@@ -89,28 +85,127 @@ GAP=4
 PERIOD=$(( OUT_H / BARS ))
 KEEP=$(( PERIOD - GAP ))
 
-# Optional ASS burn-in (single encode)
+
+#----------------------------------------------------------------------------------------------------------
+#                                   FFMPEG magic - Some notes:
+#----------------------------------------------------------------------------------------------------------
+
+# ffmpeg invocation to generate a static-background video with a left-aligned
+# frequency-bar visualizer strip and optional subtitle stage.
+#
+# Inputs:
+#   -loop 1 -i "$BG"
+#       Loop the background image indefinitely (turn single image into a video stream).
+#   -i "$AUDIO"
+#       Main audio input (drives both sound and visualization).
+#
+# Filter graph (-filter_complex):
+#
+#   [0:v]scale=${OUT_W}:${OUT_H},setsar=1,format=rgba[bg];
+#       - Scale background image to final output resolution.
+#       - setsar=1 forces square pixels (avoid inherited weird SAR).
+#       - Convert to RGBA to ensure alpha-capable compositing.
+#       - Label result as [bg].
+#
+#   [1:a]showfreqs=...
+#       Generate frequency spectrum from audio:
+#         s=$((BARS+1))x${STRIP_W}
+#             Internal resolution of spectrum (freq bins × strip width).
+#             +1 bin avoids right-edge clipping after crop.
+#         mode=bar
+#             Render vertical bars (not line/combined).
+#         ascale=log
+#             Logarithmic amplitude scaling (more perceptually useful).
+#         fscale=log
+#             Logarithmic frequency spacing (denser low-end detail).
+#         win_size=8192
+#             FFT window size (higher = better frequency resolution, slower response).
+#         overlap=1
+#             Maximum frame overlap (smoother animation, more CPU).
+#         colors=${COLOR}
+#             Bar color definition.
+#
+#       crop=${BARS}:${STRIP_W}:0:0
+#           Trim to exact number of bars (remove extra helper column).
+#
+#       transpose=1
+#           Rotate spectrum (so bars become vertical strip layout as intended).
+#
+#       scale=${STRIP_W}:${OUT_H}:flags=neighbor
+#           Stretch spectrum to full output height.
+#           neighbor scaling keeps hard pixel edges (no smoothing/blur).
+#
+#       format=rgba
+#           Ensure alpha channel for later masking.
+#
+#       geq=... a='if(lt(mod(Y,${PERIOD}),${KEEP}),alpha(X,Y),0)'
+#           Per-pixel alpha mask:
+#             - Create horizontal stripe pattern.
+#             - Only keep rows where (Y mod PERIOD) < KEEP.
+#             - Produces dashed / segmented bar look.
+#           Result labeled as [spec].
+#
+#   [bg][spec]overlay=x=0:y=0:format=auto:shortest=1[v0]
+#       Overlay spectrum strip onto background at top-left (0,0).
+#       format=auto lets ffmpeg negotiate pixel format.
+#       shortest=1 stops overlay when shortest input ends.
+#       Output labeled as [v0].
+#
+#   ${SUB_STAGE}
+#       Optional subtitle filter chain appended here
+#       (e.g., subtitles=..., ass=..., etc.).
+#
+# Stream mapping:
+#   -map "$MAP_V"
+#       Select final filtered video stream (e.g. [v0] or subtitle-processed label).
+#   -map 1:a
+#       Map original audio stream from second input.
+#
+# Encoding:
+#   -c:v libx264
+#       H.264 video codec.
+#   -preset slow
+#       Better compression efficiency (more CPU time).
+#   -crf 18
+#       High quality visually lossless-ish setting (lower = higher quality).
+#
+#   -c:a aac -b:a 192k
+#       AAC audio at 192 kbps.
+#
+#   -shortest
+#       End output when shortest stream ends (prevents infinite background loop).
+#
+#   "$OUT"
+#       Final output file.
+
+# Optional ASS burn-in (vertical only)
 SUB_STAGE=""
 MAP_V="[v0]"
-if [ -n "$ASSFILE" ]; then
-  # libass reads the style from the ASS file; no force_style here.
-  SUB_STAGE=";[v0]subtitles='${ASSFILE}'[v]"
+
+if [ "$VERT" -eq 1 ] && [ -n "${ASSFILE:-}" ]; then
+  # Escape single quotes for ffmpeg/libass: '  ->  \'
+  ASS_ESC=${ASSFILE//\'/\\\'}
+  SUB_STAGE=";[v0]subtitles='${ASS_ESC}'[v]"
   MAP_V="[v]"
 fi
+
+FILTERGRAPH=$(
+  cat <<EOF
+[0:v]scale=${OUT_W}:${OUT_H},setsar=1,format=rgba[bg];
+[1:a]showfreqs=s=$((BARS+1))x${STRIP_W}:mode=bar:ascale=log:fscale=log:win_size=8192:overlap=1:colors=${COLOR},
+crop=${BARS}:${STRIP_W}:0:0,
+transpose=1,
+scale=${STRIP_W}:${OUT_H}:flags=neighbor,
+format=rgba,
+geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(mod(Y,${PERIOD}),${KEEP}),alpha(X,Y),0)'[spec];
+[bg][spec]overlay=x=0:y=0:format=auto:shortest=1[v0]${SUB_STAGE}
+EOF
+)
 
 ffmpeg \
   -loop 1 -i "$BG" \
   -i "$AUDIO" \
-  -filter_complex "\
-        [0:v]scale=${OUT_W}:${OUT_H},setsar=1,format=rgba[bg];\
-        [1:a]showfreqs=s=$((BARS+1))x${STRIP_W}:mode=bar:ascale=log:fscale=log:win_size=8192:overlap=1:colors=${COLOR},\
-        crop=${BARS}:${STRIP_W}:0:0,\
-        transpose=1,\
-        scale=${STRIP_W}:${OUT_H}:flags=neighbor,\
-        format=rgba,\
-        geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(mod(Y,${PERIOD}),${KEEP}),alpha(X,Y),0)'[spec];\
-        [bg][spec]overlay=x=0:y=0:format=auto:shortest=1[v0]\
-${SUB_STAGE}" \
+  -filter_complex "$FILTERGRAPH" \
   -map "$MAP_V" -map 1:a \
   -c:v libx264 -preset slow -crf 18 \
   -c:a aac -b:a 192k \
@@ -119,7 +214,7 @@ ${SUB_STAGE}" \
 
 echo "--------------------------------------------------------"
 echo "VERT=$VERT OUT_W=$OUT_W OUT_H=$OUT_H STRIP_W=$STRIP_W Color=${COLOR}"
-if [ -n "$ASSFILE" ]; then
-  echo "ASSFILE=$ASSFILE"
+if [ "$VERT" -eq 1 ] && [ -n "$ASSFILE" ]; then
+  echo "Subtitles:=$ASSFILE"
 fi
 echo "--------------------------------------------------------"
