@@ -165,9 +165,18 @@ def token_eq(a: str, b: str) -> bool:
     if 3 <= la <= 5 and 3 <= lb <= 5 and a.isalpha() and b.isalpha():
         if a[:2] == b[:2] and edit_distance_bounded(a, b, 1) <= 1:
             return True
-        return False
 
-    # Reject very short/ambiguous tokens (keeps "ihn" vs "ihnen" from silently matching)
+    # Allow very common short inflection endings when one token is a prefix of the other.
+    # Fixes cases like "ihn" <-> "ihnen" without enabling broad fuzzy matching on short words.
+    if a.isalpha() and b.isalpha():
+        short, long = (a, b) if len(a) <= len(b) else (b, a)
+        if 3 <= len(short) <= 5 and 4 <= len(long) <= 7:
+            if long.startswith(short):
+                suffix = long[len(short):]
+                if suffix in {"e", "en", "em", "er", "es", "n"}:
+                    return True
+
+                # Reject very short/ambiguous tokens (keeps "ihn" vs "ihnen" from silently matching)
     if min(la, lb) < 6:
         return False
 
@@ -308,103 +317,6 @@ def align_spans(srt_tokens: list[str], json_words: list[str]) -> list[tuple[int,
 
     return spans
 
-    def empty(x: str) -> bool:
-        return x == ""
-
-    while j < len(b) and i < len(a):
-        if empty(an[i]):
-            i += 1
-            continue
-
-        if empty(bn[j]):
-            spans[j] = None
-            j += 1
-            continue
-
-        # ----------------------------
-        # 1:1 match (exact or fuzzy)
-        # ----------------------------
-        if token_eq(an[i], bn[j]):
-            spans[j] = (i, i + 1)
-            i += 1
-            j += 1
-            continue
-
-        matched = False
-
-        # ---------------------------------------------------
-        # many JSON -> one SRT (JSON split, SRT compound)
-        # Example: JSON ["weg","von","hier"] -> SRT ["weg-von-hier"]
-        # ---------------------------------------------------
-        acc = ""
-        jj = j
-        while jj < len(b) and (jj - j) < 4:
-            if bn[jj]:
-                acc += bn[jj]
-            if token_eq(acc, an[i]):
-                for k in range(j, jj + 1):
-                    spans[k] = (i, i + 1)
-                i += 1
-                j = jj + 1
-                matched = True
-                break
-            jj += 1
-
-        if matched:
-            continue
-
-        # ---------------------------------------------------
-        # one JSON -> many SRT (SRT split, JSON compound)
-        # Example: JSON ["hausnummer"] -> SRT ["haus","nummer"]
-        # ---------------------------------------------------
-        acc = ""
-        ii = i
-        while ii < len(a) and (ii - i) < 4:
-            if an[ii]:
-                acc += an[ii]
-            if token_eq(acc, bn[j]):
-                spans[j] = (i, ii + 1)
-                i = ii + 1
-                j += 1
-                matched = True
-                break
-            ii += 1
-
-        if matched:
-            continue
-
-        # ---------------------------------------------------
-        # fallback: advance cautiously without hard-mapping
-        # ---------------------------------------------------
-        # If SRT token seems to be substring of JSON word,
-        # likely SRT split; advance SRT.
-        if an[i] and bn[j] and an[i] in bn[j]:
-            i += 1
-        else:
-            # leave as None; move JSON forward
-            spans[j] = None
-            j += 1
-
-    # -------------------------------------------------------
-    # LIMITED forward-fill (avoid catastrophic drift)
-    # Only tolerate up to 2 consecutive unmapped slots.
-    # -------------------------------------------------------
-    last = None
-    run = 0
-
-    for idx in range(len(spans)):
-        if spans[idx] is None:
-            if last is not None and run < 2:
-                spans[idx] = last
-                run += 1
-            else:
-                run += 1
-        else:
-            last = spans[idx]
-            run = 0
-
-    return spans
-
 # ------------------ rendering ------------------
 
 def render_line_with_span_subset(
@@ -415,9 +327,10 @@ def render_line_with_span_subset(
     primary_ass: str,
     hilite_ass: str,
 ) -> str:
-    """Render only tokens referenced by subset_idx, keeping their original order.
+    """
+    Render only tokens referenced by subset_idx, keeping their original order.
     Highlight the intersection of subset_idx with the given span.
-    This is what enables chunking: the displayed line is a subset of the original SRT line.
+    Inserts a 2-line wrap using \\N when chunk length > 3 (up to 6).
     """
     if not subset_idx:
         return ""
@@ -426,18 +339,71 @@ def render_line_with_span_subset(
     if span is not None:
         lo, hi = span
 
-    out = []
+    # Build raw token list for this chunk (used for choosing wrap point)
+    raw_tokens = []
+    for ti in subset_idx:
+        if 0 <= ti < len(srt_tokens):
+            raw_tokens.append(srt_tokens[ti])
+
+    if not raw_tokens:
+        return ""
+
+    split_k = choose_two_line_split(raw_tokens, max_words=6)  # <-- your rule
+
+    # Now build escaped/highlighted output in the same order
+    out_tokens = []
     for ti in subset_idx:
         if not (0 <= ti < len(srt_tokens)):
             continue
         tok = srt_tokens[ti]
         esc = ass_escape(tok)
         if span is not None and lo <= ti < hi:
-            out.append(rf"{{\c{hilite_ass}}}{esc}{{\c{primary_ass}}}")
+            out_tokens.append(rf"{{\c{hilite_ass}}}{esc}{{\c{primary_ass}}}")
         else:
-            out.append(esc)
-    return " ".join(out).strip()
+            out_tokens.append(esc)
 
+    if not out_tokens:
+        return ""
+
+    # Apply the split by token count (NOT by character count after tagging)
+    if split_k is None or split_k <= 0 or split_k >= len(out_tokens):
+        return " ".join(out_tokens).strip()
+
+    line1 = " ".join(out_tokens[:split_k]).strip()
+    line2 = " ".join(out_tokens[split_k:]).strip()
+    return (line1 + r"\N" + line2).strip()
+
+
+def choose_two_line_split(tokens: list[str], max_words: int = 6) -> int | None:
+    """
+    Return k (1..n-1) meaning: put tokens[:k] on line 1, tokens[k:] on line 2.
+    Return None => single line.
+    """
+    n = len(tokens)
+    if n <= 3:
+        return None
+
+    if n > max_words:
+        n = max_words
+        tokens = tokens[:n]
+
+    best_k = 3  # default
+    best_score: int | None = None
+
+    for k in range(1, n):
+        left = " ".join(tokens[:k])
+        right = " ".join(tokens[k:])
+        score = abs(len(left) - len(right))
+
+        # avoid widows (1-word line)
+        if k == 1 or k == n - 1:
+            score += 5
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_k = k
+
+    return best_k
 
 # ------------------ ASS output ------------------
 

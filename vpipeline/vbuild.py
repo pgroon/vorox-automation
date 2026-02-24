@@ -67,7 +67,7 @@ SUB_PRESETS = {
         # chunk/timing behaviour for srt_to_ass.py
         "slop": 0.12,
         "min_word_dur": 0.10,
-        "max_words": 4,
+        "max_words": 6,
         "min_words": 1,
         "pad": 0.2,
 
@@ -77,13 +77,13 @@ SUB_PRESETS = {
         "primary": "scheme",   # normal text color; resolved from selected SCHEME['text'] in build.py
         # highlight color is set at runtime from the selected scheme by default (can be changed below)
 
-        "outline": 1,
+        "outline": 2,
         "shadow": 0,
 
         # positioning (absolute pixel coordinates using \pos)
         "align": 6,     # middle-right
-        "margin_r": 100,
-        "y_offset": 0,  # add/subtract pixels from vertical center
+        "margin_r": 60,
+        "y_offset": -100,  # add/subtract pixels from vertical center
     }
 }
 
