@@ -4,7 +4,6 @@ import argparse
 import json
 import re
 import sys
-from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -43,13 +42,11 @@ def ass_ts(t: float) -> str:
         m = 0
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-
 def ass_escape(text: str) -> str:
     text = text.replace("\\", r"\\")
     text = text.replace("{", r"\{").replace("}", r"\}")
     text = text.replace("\n", r"\N")
     return text
-
 
 def srt_ts_to_seconds(ts: str) -> float:
     m = re.fullmatch(r"(\d\d):(\d\d):(\d\d),(\d\d\d)", ts.strip())
@@ -58,9 +55,99 @@ def srt_ts_to_seconds(ts: str) -> float:
     hh, mm, ss, ms = map(int, m.groups())
     return hh * 3600 + mm * 60 + ss + ms / 1000.0
 
+def align_spans(srt_tokens: list[str], json_words: list[str]) -> list[tuple[int, int] | None]:
+    """
+    Alignment policy:
+      1) If non-empty token counts match: map positionally 1:1. (No fuzzy checks.)
+      2) Else try limited merge/split based on exact normalized concatenation.
+      3) Else fall back to positional mapping over the shorter side (best-effort),
+         leaving extras mapped to nearest token so chunking doesn't wedge.
+    """
+    an = [norm(t) for t in srt_tokens]
+    bn = [norm(w) for w in json_words]
+
+    srt_idx = [i for i, t in enumerate(an) if t != ""]
+    json_idx = [j for j, w in enumerate(bn) if w != ""]
+
+    spans: list[tuple[int, int] | None] = [None] * len(json_words)
+
+    # -------- 1) Fast path: counts match -> positional mapping ----------
+    if len(srt_idx) == len(json_idx):
+        for k in range(len(json_idx)):
+            j = json_idx[k]
+            i = srt_idx[k]
+            spans[j] = (i, i + 1)
+        return spans
+
+    # -------- 2) Merge/split reconciliation (exact concat, no fuzzy) ----
+    i_ptr = 0  # pointer into srt_idx
+    j_ptr = 0  # pointer into json_idx
+
+    while j_ptr < len(json_idx) and i_ptr < len(srt_idx):
+        i = srt_idx[i_ptr]
+        j = json_idx[j_ptr]
+
+        # exact 1:1 normalized
+        if an[i] == bn[j]:
+            spans[j] = (i, i + 1)
+            i_ptr += 1
+            j_ptr += 1
+            continue
+
+        matched = False
+
+        # many JSON -> one SRT (JSON split, SRT compound / hyphenated)
+        # bn[j] + bn[j+1] + ... == an[i]
+        acc = ""
+        jj = j_ptr
+        while jj < len(json_idx) and (jj - j_ptr) < 6 and len(acc) <= len(an[i]):
+            acc += bn[json_idx[jj]]
+            if acc == an[i] and acc != "":
+                for k in range(j_ptr, jj + 1):
+                    spans[json_idx[k]] = (i, i + 1)
+                i_ptr += 1
+                j_ptr = jj + 1
+                matched = True
+                break
+            jj += 1
+        if matched:
+            continue
+
+        # one JSON -> many SRT (SRT split, JSON compound)
+        # an[i] + an[i+1] + ... == bn[j]
+        acc = ""
+        ii = i_ptr
+        while ii < len(srt_idx) and (ii - i_ptr) < 6 and len(acc) <= len(bn[j]):
+            acc += an[srt_idx[ii]]
+            if acc == bn[j] and acc != "":
+                spans[j] = (srt_idx[i_ptr], srt_idx[ii] + 1)
+                i_ptr = ii + 1
+                j_ptr += 1
+                matched = True
+                break
+            ii += 1
+        if matched:
+            continue
+
+        # -------- 3) Best-effort fallback: accept substitution ----------
+        # Whisper got the word wrong, you corrected it. We don't care about similarity.
+        spans[j] = (i, i + 1)
+        i_ptr += 1
+        j_ptr += 1
+
+    # Map any remaining JSON words to the last available SRT token (prevents "dropped tail")
+    last_i = srt_idx[-1] if srt_idx else None
+    while j_ptr < len(json_idx):
+        j = json_idx[j_ptr]
+        if last_i is not None:
+            spans[j] = (last_i, last_i + 1)
+        j_ptr += 1
+
+    # If SRT has extra tokens, we ignore them; they still show in display because chunk slicing uses tok_idx.
+
+    return spans
 
 # ------------------ parsing ------------------
-
 def parse_srt(path: Path):
     """Returns list: [{start, end, text}, ...]"""
     raw = path.read_text(encoding="utf-8").strip()
@@ -117,205 +204,6 @@ def norm(tok: str) -> str:
 
 def tokenize_srt(text: str) -> list[str]:
     return [t for t in text.split() if t.strip()]
-
-def edit_distance_bounded(a: str, b: str, max_dist: int) -> int:
-    """Return Levenshtein distance if <= max_dist, else max_dist+1 (early exit)."""
-    if a == b:
-        return 0
-    la, lb = len(a), len(b)
-    if abs(la - lb) > max_dist:
-        return max_dist + 1
-
-    # keep b the shorter string to reduce work
-    if lb > la:
-        a, b = b, a
-        la, lb = lb, la
-
-    prev = list(range(lb + 1))
-    for i in range(1, la + 1):
-        cur = [i] + [0] * lb
-        row_min = cur[0]
-        ai = a[i - 1]
-        for j in range(1, lb + 1):
-            cost = 0 if ai == b[j - 1] else 1
-            cur[j] = min(
-                prev[j] + 1,        # deletion
-                cur[j - 1] + 1,     # insertion
-                prev[j - 1] + cost  # substitution
-            )
-            if cur[j] < row_min:
-                row_min = cur[j]
-        if row_min > max_dist:
-            return max_dist + 1
-        prev = cur
-
-    return prev[lb]
-
-
-def token_eq(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    if not a or not b:
-        return False
-
-    la, lb = len(a), len(b)
-
-    # Narrow short-token rule: allow only tiny edits + strong prefix constraint.
-    # Fixes cases like "her" -> "herr" without making short words broadly fuzzy.
-    if 3 <= la <= 5 and 3 <= lb <= 5 and a.isalpha() and b.isalpha():
-        if a[:2] == b[:2] and edit_distance_bounded(a, b, 1) <= 1:
-            return True
-
-    # Allow very common short inflection endings when one token is a prefix of the other.
-    # Fixes cases like "ihn" <-> "ihnen" without enabling broad fuzzy matching on short words.
-    if a.isalpha() and b.isalpha():
-        short, long = (a, b) if len(a) <= len(b) else (b, a)
-        if 3 <= len(short) <= 5 and 4 <= len(long) <= 7:
-            if long.startswith(short):
-                suffix = long[len(short):]
-                if suffix in {"e", "en", "em", "er", "es", "n"}:
-                    return True
-
-                # Reject very short/ambiguous tokens (keeps "ihn" vs "ihnen" from silently matching)
-    if min(la, lb) < 6:
-        return False
-
-    # Large length jumps are likely different words.
-    if abs(la - lb) > 2:
-        return False
-
-    # 1) high similarity
-    if SequenceMatcher(None, a, b).ratio() >= 0.90:
-        return True
-
-    # 2) tolerate small edit distance for long words (typos)
-    if min(la, lb) >= 8 and a[0] == b[0] and edit_distance_bounded(a, b, 2) <= 2:
-        return True
-
-    return False
-
-def align_spans(srt_tokens: list[str], json_words: list[str]) -> list[tuple[int, int] | None]:
-    """
-    Align JSON word slots to SRT token spans.
-
-    Returns spans per JSON word: (i_start, i_end_excl) in SRT token indices, or None.
-
-    Supports:
-      - many JSON -> one SRT token  (compound joined in SRT)
-      - one JSON -> many SRT tokens (rare)
-      - conservative fuzzy substitutions (spelling corrections)
-
-    Assumes:
-      - edits are mostly punctuation/spelling + occasional compounding
-      - SRT timestamps anchor alignment per block
-    """
-    a = srt_tokens
-    b = json_words
-
-    an = [norm(x) for x in a]
-    bn = [norm(x) for x in b]
-
-    spans: list[tuple[int, int] | None] = [None] * len(b)
-
-    i = 0  # index in SRT
-    j = 0  # index in JSON
-
-    def empty(x: str) -> bool:
-        return x == ""
-
-    while j < len(b) and i < len(a):
-        if empty(an[i]):
-            i += 1
-            continue
-
-        if empty(bn[j]):
-            spans[j] = None
-            j += 1
-            continue
-
-        # ----------------------------
-        # 1:1 match (exact or fuzzy)
-        # ----------------------------
-        if token_eq(an[i], bn[j]):
-            spans[j] = (i, i + 1)
-            i += 1
-            j += 1
-            continue
-
-        matched = False
-
-        # ---------------------------------------------------
-        # many JSON -> one SRT (JSON split, SRT compound)
-        # Example: JSON ["weg","von","hier"] -> SRT ["weg-von-hier"]
-        # ---------------------------------------------------
-        acc = ""
-        jj = j
-        while jj < len(b) and (jj - j) < 4:
-            if bn[jj]:
-                acc += bn[jj]
-            if token_eq(acc, an[i]):
-                for k in range(j, jj + 1):
-                    spans[k] = (i, i + 1)
-                i += 1
-                j = jj + 1
-                matched = True
-                break
-            jj += 1
-
-        if matched:
-            continue
-
-        # ---------------------------------------------------
-        # one JSON -> many SRT (SRT split, JSON compound)
-        # Example: JSON ["hausnummer"] -> SRT ["haus","nummer"]
-        # ---------------------------------------------------
-        acc = ""
-        ii = i
-        while ii < len(a) and (ii - i) < 4:
-            if an[ii]:
-                acc += an[ii]
-            if token_eq(acc, bn[j]):
-                spans[j] = (i, ii + 1)
-                i = ii + 1
-                j += 1
-                matched = True
-                break
-            ii += 1
-
-        if matched:
-            continue
-
-        # ---------------------------------------------------
-        # fallback: advance cautiously without hard-mapping
-        # ---------------------------------------------------
-        # If SRT token seems to be substring of JSON word,
-        # likely SRT split; advance SRT.
-        if an[i] and bn[j] and an[i] in bn[j]:
-            i += 1
-        else:
-            # leave as None; move JSON forward
-            spans[j] = None
-            j += 1
-
-    # -------------------------------------------------------
-    # LIMITED forward-fill (avoid catastrophic drift)
-    # Only tolerate up to 2 consecutive unmapped slots.
-    # -------------------------------------------------------
-    last = None
-    run = 0
-
-    for idx in range(len(spans)):
-        if spans[idx] is None:
-            if last is not None and run < 2:
-                spans[idx] = last
-                run += 1
-            else:
-                run += 1
-        else:
-            last = spans[idx]
-            run = 0
-
-    return spans
 
 # ------------------ rendering ------------------
 
